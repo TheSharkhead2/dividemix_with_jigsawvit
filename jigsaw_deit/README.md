@@ -1,0 +1,1 @@
+This is code copied from the [JigsawViT](https://github.com/TheSharkhead2/JigsawViT) repo (original [here](https://github.com/yingyichen-cyy/JigsawViT)) with extraneous files/code removed and some extra stuff added that isn't relavant to that codebase.
