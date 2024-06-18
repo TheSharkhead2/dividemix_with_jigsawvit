@@ -122,6 +122,7 @@ def get_arg_parser():
                         help='finetune second net from checkpoint')
     parser.add_argument("--smoothing", type=float, default=0.1,
                         help='Label smoothing (default: 0.1)')
+    parser.add_argument("--lambda-jigsaw", type=float, default=0.1)
 
     parser.add_argument(
         '--distillation-type', default='none',
@@ -1074,10 +1075,10 @@ if __name__ == "__main__":
         # track hyperparameters and run metadata
         config={
             "learning_rate": args.lr,
-            # "architecture": "backbone",
-            # "dataset": "inat_c_train",
             "epochs": args.class_cond_epoch,
-            "batch_size": args.batch_size
+            "batch_size": args.batch_size,
+            "jigsaw_mask_ratio": args.jigsaw_mask_ratio,
+            "lambda_jigsaw (eta)": args.lambda_jigsaw
         }
     )
 
