@@ -135,13 +135,26 @@ class iNatDataset(Dataset):
 
 
 class iNatDataLoader:
-    def __init__(self, root, batch_size, num_batches, num_workers, distributed=False):
+    def __init__(
+        self,
+        root,
+        batch_size,
+        num_batches,
+        num_workers,
+        num_tasks,
+        global_rank,
+        distributed=False,
+        current_epoch=0
+    ):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.num_batches = num_batches
         self.root = root
         self.sampler = None
         self.distributed = distributed
+        self.current_epoch = current_epoch
+        self.num_tasks = num_tasks
+        self.global_rank = global_rank
 
         self.transform_train = transforms.Compose(
             [
@@ -178,7 +191,10 @@ class iNatDataLoader:
                 num_class=num_classes,
             )
             if self.distributed:
-                self.sampler = DistributedSampler(warmup_dataset)
+                self.sampler = DistributedSampler(warmup_dataset,
+                                                  num_replicas=self.num_tasks,
+                                                  rank=self.global_rank)
+                self.sampler.set_epoch(self.current_epoch)
             warmup_loader = DataLoader(
                 dataset=warmup_dataset,
                 batch_size=self.batch_size,
@@ -199,7 +215,10 @@ class iNatDataLoader:
                 num_class=num_classes,
             )
             if self.distributed:
-                self.sampler = DistributedSampler(labeled_dataset)
+                self.sampler = DistributedSampler(labeled_dataset,
+                                                  num_replicas=self.num_tasks,
+                                                  rank=self.global_rank)
+                self.sampler.set_epoch(self.current_epoch)
             labeled_loader = DataLoader(
                 dataset=labeled_dataset,
                 batch_size=self.batch_size,
@@ -218,12 +237,19 @@ class iNatDataLoader:
                 paths=paths,
                 num_class=num_classes,
             )
+            if self.distributed:
+                self.sampler = DistributedSampler(unlabeled_dataset,
+                                                  num_replicas=self.num_tasks,
+                                                  rank=self.global_rank)
+                self.sampler.set_epoch(self.current_epoch)
             unlabeled_loader = DataLoader(
                 dataset=unlabeled_dataset,
-                batch_size=int(self.batch_size),
-                shuffle=True,
+                batch_size=self.batch_size,
+                # shuffle=True, # apparently this is bad?? but was original
+                shuffle=False,
                 num_workers=self.num_workers,
                 prefetch_factor=4,
+                sampler=self.sampler
             )
             return labeled_loader, unlabeled_loader
         elif mode == "eval_train":
@@ -235,10 +261,13 @@ class iNatDataLoader:
                 num_class=num_classes,
             )
             if self.distributed:
-                self.sampler = DistributedSampler(eval_dataset)
+                self.sampler = DistributedSampler(eval_dataset,
+                                                  num_replicas=self.num_tasks,
+                                                  rank=self.global_rank)
+                self.sampler.set_epoch(self.current_epoch)
             eval_loader = DataLoader(
                 dataset=eval_dataset,
-                batch_size=1000,
+                batch_size=self.batch_size,
                 shuffle=False,
                 num_workers=self.num_workers,
                 prefetch_factor=4,
@@ -253,10 +282,13 @@ class iNatDataLoader:
                 num_class=num_classes,
             )
             if self.distributed:
-                self.sampler = DistributedSampler(test_dataset)
+                self.sampler = DistributedSampler(test_dataset,
+                                                  num_replicas=self.num_tasks,
+                                                  rank=self.global_rank)
+                self.sampler.set_epoch(self.current_epoch)
             test_loader = DataLoader(
                 dataset=test_dataset,
-                batch_size=1000,
+                batch_size=self.batch_size,
                 shuffle=False,
                 num_workers=self.num_workers,
                 prefetch_factor=4,
@@ -271,10 +303,13 @@ class iNatDataLoader:
                 num_class=num_classes,
             )
             if self.distributed:
-                self.sampler = DistributedSampler(val_dataset)
+                self.sampler = DistributedSampler(val_dataset,
+                                                  num_replicas=self.num_tasks,
+                                                  rank=self.global_rank)
+                self.sampler.set_epoch(self.current_epoch)
             val_loader = DataLoader(
                 dataset=val_dataset,
-                batch_size=1000,
+                batch_size=self.batch_size,
                 shuffle=False,
                 num_workers=self.num_workers,
                 prefetch_factor=4,

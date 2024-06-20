@@ -13,8 +13,8 @@ import torch
 from timm.data import Mixup
 from timm.utils import accuracy, ModelEma
 
-from losses import DistillationLoss
-import utils
+from jigsaw_deit.losses import DistillationLoss
+import jigsaw_deit.utils as utils
 import torch.nn.functional as F
 
 def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
@@ -28,7 +28,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
-    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
+    # for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
+    for (samples, targets, path) in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 

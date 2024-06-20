@@ -134,6 +134,19 @@ def get_arg_parser():
     parser.add_argument('--clip-grad', type=float, default=None,
                         metavar='NORM',
                         help='Clip gradient norm (default: None, no clipping)')
+    parser.add_argument('--opt', default='adamw', type=str,
+                        metavar='OPTIMIZER',
+                        help='Optimizer (default: "adamw"')
+    parser.add_argument('--weight-decay', type=float, default=0.05,
+                        help='weight decay (default: 0.05)')
+    parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
+                        help='SGD momentum (default: 0.9)')
+    parser.add_argument('--sched', default='cosine', type=str,
+                        metavar='SCHEDULER',
+                        help='LR scheduler (default: "cosine"')
+    parser.add_argument('--bce-loss', action='store_true')
+    parser.add_argument("--use-jigsaw", action="store_true")
+    parser.set_defaults(use_jigsaw=True)
 
     return parser
 
@@ -181,6 +194,12 @@ def init_distributed_mode(args):
     setup_for_distributed(args.rank == 0)
 
 
+def get_world_size():
+    if not is_dist_avail_and_initialized():
+        return 1
+    return dist.get_world_size()
+
+
 def is_dist_avail_and_initialized():
     if not dist.is_available():
         return False
@@ -210,6 +229,7 @@ def train(
     criterion,
     loss_scaler,
     device,
+    max_norm,
     cmo_loader=None,
 ):
     net.train()
@@ -219,6 +239,7 @@ def train(
     use_cmo = args.use_cmo and cmo_loader is not None
     if use_cmo:
         cmo_iter = iter(cmo_loader)
+
     num_iter = (len(labeled_trainloader.dataset) // args.batch_size) + 1
 
     metric_logger = jigsaw_deit.utils.MetricLogger(delimiter="  ")
@@ -230,7 +251,7 @@ def train(
     # for batch_idx, (inputs_x, inputs_x2, labels_x, w_x) in enumerate(
         # labeled_trainloader
     # ):
-    for batch_idx, (inputs_x, inputs_x2, labels_x, w_x) in metric_logger.log_every(labeled_trainloader, print_freq, header):
+    for (inputs_x, inputs_x2, labels_x, w_x) in metric_logger.log_every(labeled_trainloader, print_freq, header):
         try:
             inputs_u, inputs_u2 = unlabeled_train_iter.__next__()
         except:
@@ -288,10 +309,10 @@ def train(
             outputs_u22 = net2(inputs_u2)
 
             pu = (
-                torch.softmax(outputs_u11, dim=1)
-                + torch.softmax(outputs_u12, dim=1)
-                + torch.softmax(outputs_u21, dim=1)
-                + torch.softmax(outputs_u22, dim=1)
+                torch.softmax(outputs_u11.sup, dim=1)
+                + torch.softmax(outputs_u12.sup, dim=1)
+                + torch.softmax(outputs_u21.sup, dim=1)
+                + torch.softmax(outputs_u22.sup, dim=1)
             ) / 4
             ptu = pu ** (1 / args.T)  # temparature sharpening
 
@@ -303,8 +324,8 @@ def train(
             outputs_x2 = net(inputs_x2)
 
             px = (
-                torch.softmax(outputs_x, dim=1) + torch.softmax(outputs_x2,
-                                                                dim=1)
+                torch.softmax(outputs_x.sup, dim=1) + torch.softmax(
+                    outputs_x2.sup, dim=1)
             ) / 2
             px = w_x * labels_x + (1 - w_x) * px
             ptx = px ** (1 / args.T)  # temparature sharpening
@@ -314,6 +335,8 @@ def train(
 
         l = np.random.beta(args.alpha, args.alpha)
         l = max(l, 1 - l)
+
+        dist.barrier()
 
         # mixmatch
         if args.use_mixup:
@@ -349,13 +372,13 @@ def train(
             target_b[: batch_size * 2]
         )
 
-        logits = net(mixed_input)
+        # maybe?
+        mixed_input = mixed_input.to(device, non_blocking=True)
+        mixed_target = mixed_target.to(device, non_blocking=True)
 
-        # Lx = -torch.mean(torch.sum(
-        #                 F.log_softmax(logits, dim=1) * mixed_target, dim=1))
         with torch.cuda.amp.autocast():
             outputs = net(mixed_input)
-            loss = criterion(mixed_input, outputs.sup, mixed_target)
+            loss = CEloss(outputs.sup, mixed_target)
 
             loss_jigsaw = F.cross_entropy(
                 outputs.pred_jigsaw, outputs.gt_jigsaw
@@ -366,13 +389,14 @@ def train(
         loss_value = loss.item()
         loss_jigsaw_value = loss_jigsaw.item()
 
+        logits = net(mixed_input)
         # regularization
         if args.use_neg_entropy_penalty:
             penalty = conf_penalty(logits)
         else:
             prior = torch.ones(args.num_class) / args.num_class
             prior = prior.cuda()
-            pred_mean = torch.softmax(logits, dim=1).mean(0)
+            pred_mean = torch.softmax(logits.sup, dim=1).mean(0)
             penalty = torch.sum(prior * torch.log(prior / pred_mean))
 
         loss_value += penalty
@@ -386,19 +410,15 @@ def train(
 
         optimizer.zero_grad()
 
+        # dist.barrier()
         # this attribute is added by timm on one optimizer (adahessian)
         is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        loss_scaler(loss, optimizer, clip_grad=0.,
+        loss_scaler(loss, optimizer, clip_grad=max_norm,
                     parameters=net.parameters(), create_graph=is_second_order)
 
         torch.cuda.synchronize()
+        # dist.barrier()
 
-        # sys.stdout.write("\r")
-        # sys.stdout.write(
-        #     "Clothing1M | Epoch [%3d/%3d] Iter[%3d/%3d]\t  Labeled loss: %.4f "
-        #     % (epoch, args.num_epochs, batch_idx + 1, num_iter, Lx.item())
-        # )
-        # sys.stdout.flush()
         metric_logger.update(loss_total=loss_value)
         metric_logger.update(loss_jigsaw=loss_jigsaw_value)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
@@ -419,7 +439,7 @@ def warmup(
     device,
     loss_scaler
 ):
-    train_one_epoch(
+    return train_one_epoch(
         net,
         CEloss,
         dataloader,
@@ -548,15 +568,22 @@ def eval_train(epoch, model, eval_loader, CE, device):
     local_ys = []
     local_paths = []
 
+    # metric_logger = jigsaw_deit.utils.MetricLogger(delimiter="  ")
+    # metric_logger.add_meter('lr', jigsaw_deit.utils.SmoothedValue(
+    #     window_size=1, fmt='{value:.6f}'))
+    # header = 'Epoch: [{}]'.format(epoch)
+    # print_freq = 10
+
     with torch.no_grad():
-        for batch_idx, (inputs, targets, paths) in enumerate(eval_loader):
+        for batch_idx, (inputs, targets, paths) in enumerate(
+                                eval_loader):
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
             # inputs, targets = inputs.cuda(), targets.cuda()
 
             outputs = model(inputs)
-            loss = CE(outputs, targets)
+            loss = CE(outputs.sup, targets)
             local_losses.extend(loss.cpu().numpy())
             local_ys.extend(targets.cpu().numpy())
             local_paths.extend(paths)
@@ -564,6 +591,9 @@ def eval_train(epoch, model, eval_loader, CE, device):
             sys.stdout.write("\r")
             sys.stdout.write("| Evaluating loss Iter %3d\t" % (batch_idx))
             sys.stdout.flush()
+            # metric_logger.update(iteration=batch_idx)
+
+        # metric_logger.synchronize_between_processes()
 
     # Converting lists to numpy arrays for consistency
     local_losses = np.array(local_losses)
@@ -636,7 +666,7 @@ def create_model(args):
         pretrained=False,
         num_classes=args.num_class,
         drop_rate=args.jigsaw_drop,
-        drop_rate_path=args.jigsaw_drop_path,
+        drop_path_rate=args.jigsaw_drop_path,
         img_size=args.input_size
     )
 
@@ -759,9 +789,8 @@ def get_weighted_loader(cls_num_list, train_dataset):
     return weighted_loader
 
 
-def load_jigsaw_from_checkpoint(args, model):
-    checkpoint = torch.hub.load_state_dict_from_url(
-        args.finetune, map_location='cpu', check_hash=True)
+def load_jigsaw_from_checkpoint(args, model, finetune_path):
+    checkpoint = torch.load(finetune_path, map_location='cpu')
 
     checkpoint_model = checkpoint['model']
     state_dict = model.state_dict()
@@ -829,8 +858,10 @@ def main(args):
     loader = dataloader.iNatDataLoader(
         root=args.data_path,
         batch_size=args.batch_size,
-        num_workers=5,
+        num_workers=12,
         num_batches=args.num_batches,
+        num_tasks=get_world_size(),
+        global_rank=get_rank(),
         distributed=True
     )
 
@@ -839,9 +870,9 @@ def main(args):
     net2 = create_model(args)
 
     if args.jigsaw_finetune1:
-        load_jigsaw_from_checkpoint(args, net1)
+        load_jigsaw_from_checkpoint(args, net1, args.jigsaw_finetune1)
     if args.jigsaw_finetune2:
-        load_jigsaw_from_checkpoint(args, net2)
+        load_jigsaw_from_checkpoint(args, net2, args.jigsaw_finetune2)
 
     net1.to(device)
     net2.to(device)
@@ -875,15 +906,11 @@ def main(args):
     criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     # criterion = torch.nn.CrossEntropyLoss()
 
-    # this isn't really necessary as Jigsaw paper doesn't use this feature?
-    # though might be good to look into. In particular: this distillation
-    # feature is for the DeiT structure, where Jigsaw actually just has this
-    # off, creating a normal ViT structure
-    # teacher_model = None
-    # criterion = DistillationLoss(
-    #     criterion, teacher_model, args.distillation_type,
-    #     args.distillation_alpha, args.distillation_tau
-    # )
+    teacher_model = None
+    criterion = DistillationLoss(
+        criterion, teacher_model, args.distillation_type,
+        args.distillation_alpha, args.distillation_tau
+    )
 
     CE = nn.CrossEntropyLoss(reduction="none")
     CEloss = nn.CrossEntropyLoss()
@@ -899,7 +926,11 @@ def main(args):
 
     best_acc = [0, 0]
     for epoch in range(args.restart_epoch, args.num_epochs + 1):
-        loader.sampler.set_epoch(epoch)
+        # loader.sampler.set_epoch(epoch)
+        # loader.current_epoch = epoch
+
+        dist.barrier()
+
         lr = args.lr
         if epoch >= 40:
             lr /= 10
@@ -910,14 +941,19 @@ def main(args):
 
         if epoch < args.warmup:  # warm up
             train_loader = loader.run("warmup", num_classes=args.num_class)
+            train_loader.sampler.set_epoch(epoch)
+
             print("Warmup Net1")
             if args.use_cmo and epoch > 4:
                 class_counts = get_class_counts(train_loader.dataset, args)
                 train_loader = get_weighted_loader(class_counts,
                                                    train_loader.dataset)
-            warmup(args, net1, optimizer1, train_loader, epoch, CEloss,
-                   conf_penalty, device, loss_scaler)
+            net1_train_stats = warmup(args, net1, optimizer1, train_loader,
+                                      epoch, criterion, conf_penalty, device,
+                                      loss_scaler)
             train_loader = loader.run("warmup", num_classes=args.num_class)
+            train_loader.sampler.set_epoch(epoch)
+
             if args.use_cmo and epoch > 4:
                 class_counts = get_class_counts(train_loader.dataset, args)
                 train_loader = get_weighted_loader(class_counts,
@@ -926,8 +962,9 @@ def main(args):
             train_loader.sampler.set_epoch(epoch)  # need for distributed
 
             print("\nWarmup Net2")
-            warmup(args, net2, optimizer2, train_loader, epoch, CEloss,
-                   conf_penalty, device, loss_scaler)
+            net2_train_stats = warmup(args, net2, optimizer2, train_loader,
+                                      epoch, criterion, conf_penalty, device,
+                                      loss_scaler)
             if args.use_gnn and epoch == args.warmup - 1:
                 train_gnn(net2, args, loader)
 
@@ -939,6 +976,9 @@ def main(args):
             labeled_trainloader, unlabeled_trainloader = loader.run(
                 "train", pred2, prob2, paths=paths2, num_classes=args.num_class
             )  # co-divide
+            labeled_trainloader.sampler.set_epoch(epoch)
+            unlabeled_trainloader.sampler.set_epoch(epoch)
+
             if args.use_cmo:
                 class_counts = get_class_counts(
                     labeled_trainloader.dataset, args
@@ -959,13 +999,18 @@ def main(args):
                 conf_penalty,
                 criterion,
                 loss_scaler,
-                cmo_loader=weighted_labeled_loader if args.use_cmo else None,
+                device,
+                args.clip_grad
+                # cmo_loader=weighted_labeled_loader if args.use_cmo else None,
             )  # train net1
 
             print("\nTrain Net2")
             labeled_trainloader, unlabeled_trainloader = loader.run(
                 "train", pred1, prob1, paths=paths1, num_classes=args.num_class
             )  # co-divide
+
+            labeled_trainloader.sampler.set_epoch(epoch)
+            unlabeled_trainloader.sampler.set_epoch(epoch)
 
             net2_train_stats = train(
                 epoch,
@@ -977,13 +1022,19 @@ def main(args):
                 CEloss,
                 conf_penalty,
                 criterion,
-                loss_scaler
+                loss_scaler,
+                device,
+                args.clip_grad
             )  # train net2
             if (epoch % 5 == 0 or epoch == args.num_epochs) and args.use_gnn:
                 train_gnn(net2, args, loader)
 
+        dist.barrier()
         val_loader = loader.run("val", num_classes=args.num_class)  # validation
         test_loader = loader.run("test", num_classes=args.num_class) 
+
+        val_loader.sampler.set_epoch(epoch)
+        test_loader.sampler.set_epoch(epoch)
 
         net1_val_stats, net1_test_stats = val(net1, val_loader, test_loader, 1,
                                               best_acc, device)
@@ -1019,9 +1070,15 @@ def main(args):
             eval_loader = loader.run(
                 "eval_train", num_classes=args.num_class
             )  # evaluate training data loss for next epoch
+
+            eval_loader.sampler.set_epoch(epoch)
+            
             prob1, paths1 = eval_train(epoch, net1, eval_loader, CE, device)
             print("\n==== net 2 evaluate next epoch training data loss ====")
             eval_loader = loader.run("eval_train", num_classes=args.num_class)
+
+            eval_loader.sampler.set_epoch(epoch)
+            
             if args.use_gnn:
                 prob2, paths2 = eval_train_gnn(net2, CE, args, epoch, loader)
             prob2, paths2 = eval_train(epoch, net2, eval_loader, CE, device)
