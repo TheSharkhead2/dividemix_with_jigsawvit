@@ -249,7 +249,7 @@ def train(
     print_freq = 10
 
     # for batch_idx, (inputs_x, inputs_x2, labels_x, w_x) in enumerate(
-        # labeled_trainloader
+    #   labeled_trainloader
     # ):
     for (inputs_x, inputs_x2, labels_x, w_x) in metric_logger.log_every(labeled_trainloader, print_freq, header):
         try:
@@ -386,20 +386,27 @@ def train(
 
             loss += loss_jigsaw
 
+            prior = torch.ones(args.num_class) / args.num_class
+            prior = prior.to(device, non_blocking=True)
+            pred_mean = torch.softmax(outputs.sup, dim=1).mean(0)
+            penalty = torch.sum(prior * torch.log(prior / pred_mean))
+
+            loss = loss + penalty
+
         loss_value = loss.item()
         loss_jigsaw_value = loss_jigsaw.item()
 
-        logits = net(mixed_input)
-        # regularization
-        if args.use_neg_entropy_penalty:
-            penalty = conf_penalty(logits)
-        else:
-            prior = torch.ones(args.num_class) / args.num_class
-            prior = prior.cuda()
-            pred_mean = torch.softmax(logits.sup, dim=1).mean(0)
-            penalty = torch.sum(prior * torch.log(prior / pred_mean))
+        # logits = net(mixed_input)
+        # # regularization
+        # if args.use_neg_entropy_penalty:
+        #     penalty = conf_penalty(logits)
+        # else:
+        #     prior = torch.ones(args.num_class) / args.num_class
+        #     prior = prior.cuda()
+        #     pred_mean = torch.softmax(logits.sup, dim=1).mean(0)
+        #     penalty = torch.sum(prior * torch.log(prior / pred_mean))
 
-        loss_value += penalty
+        # loss_value += penalty
         if not args.use_mixup:
             loss = loss + supervised_loss
 
@@ -410,6 +417,7 @@ def train(
 
         optimizer.zero_grad()
 
+
         # dist.barrier()
         # this attribute is added by timm on one optimizer (adahessian)
         is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
@@ -419,10 +427,12 @@ def train(
         torch.cuda.synchronize()
         # dist.barrier()
 
+        
         metric_logger.update(loss_total=loss_value)
         metric_logger.update(loss_jigsaw=loss_jigsaw_value)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
+    dist.barrier()
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
@@ -568,15 +578,18 @@ def eval_train(epoch, model, eval_loader, CE, device):
     local_ys = []
     local_paths = []
 
-    # metric_logger = jigsaw_deit.utils.MetricLogger(delimiter="  ")
+    metric_logger = jigsaw_deit.utils.MetricLogger(delimiter="  ")
     # metric_logger.add_meter('lr', jigsaw_deit.utils.SmoothedValue(
-    #     window_size=1, fmt='{value:.6f}'))
-    # header = 'Epoch: [{}]'.format(epoch)
-    # print_freq = 10
+        # window_size=1, fmt='{value:.6f}'))
+    header = 'Epoch: [{}]'.format(epoch)
+    print_freq = 10
 
     with torch.no_grad():
-        for batch_idx, (inputs, targets, paths) in enumerate(
-                                eval_loader):
+        # for batch_idx, (inputs, targets, paths) in enumerate(
+        #                         eval_loader):
+        for (inputs, targets, paths) in metric_logger.log_every(
+            eval_loader, print_freq, header
+        ):
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
@@ -588,12 +601,13 @@ def eval_train(epoch, model, eval_loader, CE, device):
             local_ys.extend(targets.cpu().numpy())
             local_paths.extend(paths)
 
-            sys.stdout.write("\r")
-            sys.stdout.write("| Evaluating loss Iter %3d\t" % (batch_idx))
-            sys.stdout.flush()
+            # sys.stdout.write("\r")
+            # sys.stdout.write("| Evaluating loss Iter %3d\t" % (batch_idx))
+            # sys.stdout.flush()
             # metric_logger.update(iteration=batch_idx)
+            # metric_logger.update(loss=loss.item())
 
-        # metric_logger.synchronize_between_processes()
+        metric_logger.synchronize_between_processes()
 
     # Converting lists to numpy arrays for consistency
     local_losses = np.array(local_losses)
@@ -614,29 +628,34 @@ def eval_train(epoch, model, eval_loader, CE, device):
     ), "Lengths do not match"
 
     prob = np.zeros(len(global_ys))
-    if epoch < args.class_cond_epoch:
-        for y in set(global_ys):
-            idx = global_ys == y
-            if idx.sum() == 1:
-                prob[idx] = 0
-                continue
-            curr_losses = (global_losses[idx] - global_losses[idx].min()) / (
-                global_losses[idx].max() - global_losses[idx].min() + 1e-8
-            )
-            curr_losses = curr_losses.reshape(-1, 1)
+    if get_rank() == 0:
+        if epoch < args.class_cond_epoch:
+            for y in set(global_ys):
+                idx = global_ys == y
+                if idx.sum() == 1:
+                    prob[idx] = 0
+                    continue
+                curr_losses = (global_losses[idx] - global_losses[idx].min()) / (
+                    global_losses[idx].max() - global_losses[idx].min() + 1e-8
+                )
+                curr_losses = curr_losses.reshape(-1, 1)
+                gmm = GaussianMixture(
+                            n_components=2, max_iter=10, reg_covar=5e-4, tol=1e-2)
+                gmm.fit(curr_losses)
+                curr_prob = gmm.predict_proba(curr_losses)
+                prob[idx] = curr_prob[:, gmm.means_.argmin()]
+        else:
+            global_losses = (global_losses - global_losses.min()) / (global_losses.max() - global_losses.min())
+            global_losses = global_losses.reshape(-1, 1)
             gmm = GaussianMixture(
-                        n_components=2, max_iter=10, reg_covar=5e-4, tol=1e-2)
-            gmm.fit(curr_losses)
-            curr_prob = gmm.predict_proba(curr_losses)
-            prob[idx] = curr_prob[:, gmm.means_.argmin()]
-    else:
-        global_losses = (global_losses - global_losses.min()) / (global_losses.max() - global_losses.min())
-        global_losses = global_losses.reshape(-1, 1)
-        gmm = GaussianMixture(
-                        n_components=2, max_iter=15, reg_covar=5e-4, tol=1e-2)
-        gmm.fit(global_losses)
-        prob = gmm.predict_proba(global_losses)
-        prob = prob[:, gmm.means_.argmin()]
+                            n_components=2, max_iter=15, reg_covar=5e-4, tol=1e-2)
+            gmm.fit(global_losses)
+            prob = gmm.predict_proba(global_losses)
+            prob = prob[:, gmm.means_.argmin()]
+
+    # sync prob and paths
+    dist.barrier()
+    dist.broadcast_object_list([prob, global_paths], src=0)
 
     return prob, global_paths
 
@@ -1049,20 +1068,21 @@ def main(args):
                                                   device)
 
         # wandb.log({'acc1': acc1, 'acc2': acc2})
-        wandb.log({
-            "net1_test_acc1": net1_test_stats['acc1'],
-            "net2_test_acc1": net2_test_stats['acc1'],
-            "net1_test_acc5": net1_test_stats['acc5'],
-            "net2_test_acc5": net2_test_stats['acc5'],
-            "net1_test_loss": net1_test_stats['loss'],
-            "net2_test_loss": net2_test_stats['loss'],
-            "net1_train_loss_total": net1_train_stats['loss_total'],
-            "net2_train_loss_total": net2_train_stats['loss_total'],
-            "net1_train_loss_jigsaw": net1_train_stats['loss_jigsaw'],
-            "net2_train_loss_jigsaw": net2_train_stats['loss_jigsaw'],
-            "net1_test_class_avg_acc": net1_test_stats['class_avg_acc'],
-            "net2_test_class_avg_acc": net2_test_stats['class_avg_acc']
-        })
+        if get_rank() == 0:
+            wandb.log({
+                "net1_test_acc1": net1_test_stats['acc1'],
+                "net2_test_acc1": net2_test_stats['acc1'],
+                "net1_test_acc5": net1_test_stats['acc5'],
+                "net2_test_acc5": net2_test_stats['acc5'],
+                "net1_test_loss": net1_test_stats['loss'],
+                "net2_test_loss": net2_test_stats['loss'],
+                "net1_train_loss_total": net1_train_stats['loss_total'],
+                "net2_train_loss_total": net2_train_stats['loss_total'],
+                "net1_train_loss_jigsaw": net1_train_stats['loss_jigsaw'],
+                "net2_train_loss_jigsaw": net2_train_stats['loss_jigsaw'],
+                "net1_test_class_avg_acc": net1_test_stats['class_avg_acc'],
+                "net2_test_class_avg_acc": net2_test_stats['class_avg_acc']
+            })
 
         log.flush()
         if epoch >= args.warmup - 1:
@@ -1071,40 +1091,41 @@ def main(args):
                 "eval_train", num_classes=args.num_class
             )  # evaluate training data loss for next epoch
 
-            eval_loader.sampler.set_epoch(epoch)
-            
             prob1, paths1 = eval_train(epoch, net1, eval_loader, CE, device)
             print("\n==== net 2 evaluate next epoch training data loss ====")
-            eval_loader = loader.run("eval_train", num_classes=args.num_class)
+            eval_loader = loader.run(
+                "eval_train",
+                num_classes=args.num_class
+            )
 
-            eval_loader.sampler.set_epoch(epoch)
-            
             if args.use_gnn:
                 prob2, paths2 = eval_train_gnn(net2, CE, args, epoch, loader)
             prob2, paths2 = eval_train(epoch, net2, eval_loader, CE, device)
-            # Serialize prob1
-            prob1 = prob1
-            print('paths1')
-            print(len(paths1))
-            print('probs1')
-            print(len(prob1))
-            pd.DataFrame(
-                {
-                    "probs": prob1,
-                    "paths": paths1,
-                }
-            ).to_csv(f"{args.out_dir}/%s_net1_probs.csv" % epoch)
-            print('paths2')
-            print(len(paths2))
-            print('probs2')
-            print(len(prob2))
 
-            pd.DataFrame(
-                {
-                    "probs": prob2,
-                    "paths": paths2,
-                }
-            ).to_csv(f"{args.out_dir}/%s_net2_probs.csv" % epoch)
+            if get_rank() == 0:
+                # Serialize prob1
+                prob1 = prob1
+                print('paths1')
+                print(len(paths1))
+                print('probs1')
+                print(len(prob1))
+                pd.DataFrame(
+                    {
+                        "probs": prob1,
+                        "paths": paths1,
+                    }
+                ).to_csv(f"{args.out_dir}/%s_net1_probs.csv" % epoch)
+                print('paths2')
+                print(len(paths2))
+                print('probs2')
+                print(len(prob2))
+
+                pd.DataFrame(
+                    {
+                        "probs": prob2,
+                        "paths": paths2,
+                    }
+                ).to_csv(f"{args.out_dir}/%s_net2_probs.csv" % epoch)
 
     test_loader = loader.run("test", num_classes=args.num_class)
     net1.load_state_dict(torch.load(
@@ -1125,18 +1146,19 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    wandb.init(
-        # set the wandb project where this run will be logged
-        project=args.wandb_project,
+    if get_rank() == 0:
+        wandb.init(
+            # set the wandb project where this run will be logged
+            project=args.wandb_project,
 
-        # track hyperparameters and run metadata
-        config={
-            "learning_rate": args.lr,
-            "epochs": args.class_cond_epoch,
-            "batch_size": args.batch_size,
-            "jigsaw_mask_ratio": args.jigsaw_mask_ratio,
-            "lambda_jigsaw (eta)": args.lambda_jigsaw
-        }
-    )
+            # track hyperparameters and run metadata
+            config={
+                "learning_rate": args.lr,
+                "epochs": args.class_cond_epoch,
+                "batch_size": args.batch_size,
+                "jigsaw_mask_ratio": args.jigsaw_mask_ratio,
+                "lambda_jigsaw (eta)": args.lambda_jigsaw
+            }
+        )
 
     main(args)

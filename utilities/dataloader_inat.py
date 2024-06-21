@@ -181,7 +181,7 @@ class iNatDataLoader:
             ]
         )
 
-    def run(self, mode, pred=[], prob=[], paths=[], num_classes=1000):
+    def run(self, mode, pred=[], prob=[], paths=[], num_classes=1000, gmm=False):
         if mode == "warmup":
             warmup_dataset = iNatDataset(
                 self.root,
@@ -252,6 +252,23 @@ class iNatDataLoader:
                 sampler=self.sampler
             )
             return labeled_loader, unlabeled_loader
+        # elif mode == "eval_train" and gmm:
+        #     # same as eval train but not distributed
+        #     eval_dataset = iNatDataset(
+        #         self.root,
+        #         transform=self.transform_test,
+        #         mode="all",
+        #         num_samples=self.num_batches * self.batch_size * 10,
+        #         num_class=num_classes,
+        #     )
+        #     eval_loader = DataLoader(
+        #         dataset=eval_dataset,
+        #         batch_size=self.batch_size,
+        #         shuffle=False,
+        #         num_workers=self.num_workers,
+        #         prefetch_factor=4,
+        #     )
+        #     return eval_loader
         elif mode == "eval_train":
             eval_dataset = iNatDataset(
                 self.root,
